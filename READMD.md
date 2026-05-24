@@ -39,7 +39,7 @@ The TN Land Document Pre-Validation Pipeline ingests scanned PDF uploads from a 
 
 **What it will catch (Phase 2 — wired, not yet active):**
 - Semantic anomalies via Pinecone vector similarity against known-good document templates
-- Legal clause pattern matching via LangChain + OpenAI embeddings
+- Legal clause pattern matching via LangChain + OpenAI embeddings (embeddings only — generation via OpenRouter)
 - Cross-document inconsistencies (Patta number referenced in Sale Deed does not exist in records)
 
 **Output:** A structured JSON validation report with per-field status (`PASS` / `FAIL` / `MISSING`), severity (`CRITICAL` / `WARNING`), and human-readable explanations in both English and Tamil, surfaced via a React web portal.
@@ -76,8 +76,9 @@ The TN Land Document Pre-Validation Pipeline ingests scanned PDF uploads from a 
                              │
          ┌───────────────────┼───────────────────┐
          ▼                   ▼                   ▼
-  Azure Doc Intelligence   OpenAI GPT-4o      Pinecone
-  (OCR + field extract)    (feedback gen)     (semantic index, Ph.2)
+  Azure Doc Intelligence   OpenRouter          Pinecone
+  (OCR + field extract)    (Gemma 3 27B        (semantic index, Ph.2)
+                            feedback gen)
 ```
 
 ### Key design decisions
@@ -89,7 +90,9 @@ The TN Land Document Pre-Validation Pipeline ingests scanned PDF uploads from a 
 | DuckDB in-pod for Phase 1 checks | Field presence and format checks are analytical queries over a small JSON blob. In-process DuckDB runs these 10× faster than round-tripping to PostgreSQL. PostgreSQL only receives the final committed result. |
 | PostgreSQL over SQL Server | JSONB columns store semi-structured extraction results without schema migrations per document type. Row-level security enables per-office data isolation. Full SQLAlchemy + Alembic support. |
 | Azure Document Intelligence | Best-in-class OCR for mixed Tamil/English handwritten + printed government forms. The prebuilt General Document model handles both without custom training for Phase 1. |
-| `response_format: json_object` for OpenAI | Enforces structured JSON output from the feedback node. Eliminates regex parsing of model responses and prevents hallucinated rule names. |
+| OpenRouter as LLM gateway | Single OpenAI-compatible endpoint giving access to Gemma 3 27B, Llama 3.3 70B, and others. No GPU infrastructure to manage. Model is swappable via an env var — no code change required. Built-in fallback chain retries with a stronger model if JSON parsing fails. |
+| `response_format: json_object` for feedback | Enforces structured JSON output from the feedback node across all OpenRouter-served models. Eliminates regex parsing and prevents hallucinated rule names. |
+| OpenAI embeddings for Phase 2 | OpenRouter does not serve embedding models. OpenAI `text-embedding-3-small` is kept solely for Pinecone indexing at ~$0.02/million tokens — negligible cost compared to generation. |
 
 ---
 
@@ -100,7 +103,8 @@ The TN Land Document Pre-Validation Pipeline ingests scanned PDF uploads from a 
 | API | FastAPI | 0.111+ |
 | Orchestration | LangGraph | 0.2+ |
 | Task queue | Celery + Redis | 5.4+ |
-| AI/LLM | LangChain + OpenAI GPT-4o | Latest |
+| AI/LLM gateway | OpenRouter (Gemma 3 27B · Llama 3.3 70B fallback) | Latest |
+| Embeddings | OpenAI `text-embedding-3-small` (Phase 2 only) | Latest |
 | Vector store | Pinecone | v3 SDK |
 | OCR | Azure Document Intelligence | 2024-02-29-preview |
 | In-pipeline analytics | DuckDB | 0.10+ |
@@ -139,7 +143,7 @@ tn-land-validator/
 │   │   ├── field_checker.py        # Node 2: DuckDB presence + format + logic checks
 │   │   ├── cross_field.py          # Node 3: District/taluk hierarchy + date logic
 │   │   ├── semantic.py             # Node 4: Pinecone similarity (Phase 2 stub)
-│   │   └── feedback.py             # Node 5: OpenAI structured feedback generation
+│   │   └── feedback.py             # Node 5: OpenRouter feedback generation (Gemma 3 27B)
 │   └── rules/
 │       ├── required_fields.py      # Field manifests per document type
 │       ├── format_rules.py         # Regex + type validators
@@ -404,10 +408,112 @@ FORMAT_RULES = {
 }
 ```
 
-### Celery task
+### Node: feedback (OpenRouter · Gemma 3 27B)
+
+The feedback node is the only node that calls an external LLM. It uses OpenRouter's OpenAI-compatible API with a two-model fallback chain — Gemma 3 27B first, Llama 3.3 70B if JSON parsing fails. The system prompt seeds known-correct Tamil phrases to prevent colloquial or incorrect phrasing in legal contexts.
 
 ```python
-# workers/tasks.py
+# pipeline/nodes/feedback.py
+from langchain_openai import ChatOpenAI
+from pipeline.state import DocumentState
+from pipeline.config import settings
+import json, structlog
+from prometheus_client import Counter
+
+log = structlog.get_logger()
+
+llm_model_used = Counter(
+    "feedback_model_used_total",
+    "Feedback generation calls by model and outcome",
+    ["model", "outcome"],
+)
+
+# Ordered fallback chain — first model is tried first; next is used if JSON parse fails
+MODELS = [
+    "google/gemma-3-27b-it",               # fast, cheap, good Tamil coverage
+    "meta-llama/llama-3.3-70b-instruct",   # stronger JSON reliability as fallback
+]
+
+SYSTEM_PROMPT = """
+You are a document validation assistant for Tamil Nadu land registration offices.
+Respond ONLY with valid JSON. No explanation, no markdown, no preamble.
+
+Use these verified Tamil phrases for common errors:
+- Missing field:        "தேவையான புலம் காணப்படவில்லை"
+- Invalid format:       "தவறான வடிவம் உள்ளது"
+- Date error:           "தேதி தவறானது"
+- Survey number error:  "கணக்கெடுப்பு எண் தவறானது"
+- Hierarchy mismatch:   "மாவட்டம்/தாலுகா பொருந்தவில்லை"
+
+JSON schema (strict — output nothing else):
+{
+  "overall_status": "PASS" | "FAIL",
+  "summary_en": "<one sentence in English>",
+  "summary_ta": "<one sentence in Tamil script>",
+  "fields": {
+    "<field_name>": {
+      "status": "PASS" | "FAIL" | "MISSING",
+      "severity": "CRITICAL" | "WARNING" | "INFO",
+      "message_en": "<explanation in English>",
+      "message_ta": "<explanation in Tamil script>"
+    }
+  }
+}
+"""
+
+def _build_llm(model: str) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=model,
+        base_url=settings.OPENROUTER_BASE_URL,
+        api_key=settings.OPENROUTER_API_KEY,
+        model_kwargs={
+            "response_format": {"type": "json_object"},
+            "extra_headers": {
+                "HTTP-Referer": "https://tn-land-validator.yourdomain.in",
+                "X-Title": "TN Land Validator",
+            },
+        },
+        temperature=0,
+        max_tokens=1024,
+    )
+
+def run(state: DocumentState) -> DocumentState:
+    violations = [r for r in state["check_results"] if r["status"] != "PASS"]
+
+    user_msg = f"""
+Document type: {state["doc_type"]}
+Extracted fields: {json.dumps(state["fields_extracted"], ensure_ascii=False)}
+Validation violations: {json.dumps(violations, ensure_ascii=False)}
+
+Generate the validation feedback report following the JSON schema exactly.
+"""
+    for model in MODELS:
+        try:
+            llm      = _build_llm(model)
+            response = llm.invoke([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ])
+            report = json.loads(response.content)
+            llm_model_used.labels(model=model, outcome="success").inc()
+            log.info("feedback.generated", doc_id=state["doc_id"],
+                     model=model, overall=report.get("overall_status"))
+            return {**state, "feedback_report": report, "feedback_model": model}
+        except json.JSONDecodeError:
+            llm_model_used.labels(model=model, outcome="json_parse_failed").inc()
+            log.warning("feedback.json_parse_failed", doc_id=state["doc_id"],
+                        model=model, raw=response.content[:200])
+            continue
+        except Exception as exc:
+            llm_model_used.labels(model=model, outcome="error").inc()
+            log.error("feedback.error", doc_id=state["doc_id"],
+                      model=model, error=str(exc))
+            continue
+
+    return {**state, "error": "all_feedback_models_failed"}
+```
+
+### Celery task
 from workers.celery_app import celery_app
 from pipeline.graph import pipeline
 from pipeline.state import DocumentState
@@ -611,8 +717,11 @@ All configuration is injected via environment variables. For local dev, use `.en
 | `AZURE_BLOB_CONTAINER` | Yes | Container name for PDF uploads |
 | `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` | Yes | Azure Doc Intelligence endpoint URL |
 | `AZURE_DOCUMENT_INTELLIGENCE_KEY` | Yes | Azure Doc Intelligence API key (use Key Vault ref in prod) |
-| `OPENAI_API_KEY` | Yes | OpenAI API key (use Key Vault ref in prod) |
-| `OPENAI_MODEL` | No | Model name — default `gpt-4o` |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter API key — `sk-or-...` (use Key Vault ref in prod) |
+| `OPENROUTER_BASE_URL` | No | OpenRouter base URL — default `https://openrouter.ai/api/v1` |
+| `OPENROUTER_PRIMARY_MODEL` | No | Primary feedback model — default `google/gemma-3-27b-it` |
+| `OPENROUTER_FALLBACK_MODEL` | No | Fallback feedback model — default `meta-llama/llama-3.3-70b-instruct` |
+| `OPENAI_API_KEY` | No | OpenAI API key — used only for Phase 2 embeddings (`text-embedding-3-small`) |
 | `PINECONE_API_KEY` | No | Pinecone API key (Phase 2) |
 | `PINECONE_INDEX_NAME` | No | Pinecone index name (Phase 2) |
 | `EARLY_EXIT_THRESHOLD` | No | Min critical failures before early exit — default `3` |
@@ -761,7 +870,8 @@ Key metrics:
 | `pipeline_duration_seconds` | Histogram | End-to-end pipeline duration |
 | `node_duration_seconds` | Histogram | Per-node duration, labelled by `node_name` |
 | `ocr_duration_seconds` | Histogram | Azure Doc Intelligence call latency |
-| `openai_tokens_used_total` | Counter | Total tokens consumed, labelled by `model` |
+| `llm_tokens_used_total` | Counter | Total tokens consumed via OpenRouter, labelled by `model` |
+| `feedback_model_used_total` | Counter | Feedback generation calls labelled by `model` and `outcome` (`success` / `json_parse_failed` / `error`) |
 | `critical_failures_total` | Counter | Critical validation failures, labelled by `field` and `doc_type` |
 | `queue_depth` | Gauge | Celery queue depth (Celery Exporter) |
 
@@ -781,7 +891,8 @@ Three dashboards are provisioned via Terraform (JSON files in `infra/grafana/`):
 | Stuck pipeline | Any run in `processing` state > 5 min | Sev 2 |
 | Queue depth high | Celery queue depth > 50 for 2 min | Sev 2 |
 | OCR latency degraded | p95 OCR duration > 30s | Sev 3 |
-| OpenAI token budget | Daily tokens > 80% of budget | Sev 3 |
+| OpenRouter spend | Daily spend > 80% of budget | Sev 3 |
+| Fallback model elevated | `feedback_model_used_total{model="llama-3.3-70b"}` > 10% of calls over 30 min | Sev 3 |
 
 ---
 
@@ -1061,6 +1172,9 @@ spec:
     objects: |
       array:
         - |
+          objectName: openrouter-api-key
+          objectType: secret
+        - |
           objectName: openai-api-key
           objectType: secret
         - |
@@ -1106,19 +1220,25 @@ AKS liveness and readiness probes are configured in Helm values to use `/health/
 
 ---
 
-### RB-02: OpenAI token budget exceeded
+### RB-02: OpenRouter spend spike
 
-**Trigger:** Azure Monitor alert "OpenAI token budget" fires — daily usage > 80% of budget before EOD.
+**Trigger:** Azure Monitor alert "OpenRouter spend" fires — daily spend > 80% of budget before EOD, or the `feedback_model_used_total{outcome="json_parse_failed"}` rate rises above 10% (Gemma producing malformed JSON, falling back to Llama and doubling cost per document).
 
 **Steps:**
-1. Check Grafana `Pipeline Overview` → `openai_tokens_used_total` to identify the spike.
-2. If a single `doc_type` is consuming disproportionate tokens, reduce the feedback prompt for that type in `pipeline/nodes/feedback.py` (`max_tokens` parameter).
-3. As an emergency measure, switch `OPENAI_MODEL` from `gpt-4o` to `gpt-4o-mini` via Key Vault and restart workers:
+1. Check Grafana `Pipeline Overview` → `feedback_model_used_total` to determine whether it is a volume spike or a fallback-chain issue.
+2. If fallback rate is elevated, Gemma 3 27B may be receiving malformed extraction payloads (large garbage OCR text inflating the prompt). Check `fields_extracted` sizes in PostgreSQL:
+   ```sql
+   SELECT doc_id, pg_column_size(fields_extracted) AS size_bytes
+   FROM validation_runs ORDER BY size_bytes DESC LIMIT 10;
+   ```
+3. If prompts are bloated, truncate the `fields_extracted` payload in `feedback.py` before sending (cap each field value at 500 chars).
+4. To switch the primary model without a code deploy, update Key Vault and restart workers:
    ```bash
-   az keyvault secret set --vault-name tn-validator-kv --name openai-model --value gpt-4o-mini
+   az keyvault secret set --vault-name tn-validator-kv \
+     --name openrouter-primary-model --value "google/gemma-3-12b-it"
    kubectl rollout restart deployment/tn-validator-worker
    ```
-4. Investigate whether malformed extractions are inflating prompt sizes (large garbage text in extracted fields).
+5. If budget is still breached, set `EARLY_EXIT_THRESHOLD=1` to skip feedback generation on severely broken documents (those with 1+ critical failures get a templated report instead of an LLM-generated one).
 
 ---
 
@@ -1142,7 +1262,7 @@ AKS liveness and readiness probes are configured in Helm values to use `/health/
 - [x] LangGraph pipeline skeleton
 - [x] Azure Document Intelligence OCR extraction
 - [x] DuckDB field presence + format + logic checks
-- [x] OpenAI feedback generation (EN + Tamil)
+- [x] OpenRouter feedback generation (Gemma 3 27B · EN + Tamil · fallback chain)
 - [x] PostgreSQL persistence
 - [x] FastAPI status + report endpoints
 - [x] Celery task queue
@@ -1152,7 +1272,7 @@ AKS liveness and readiness probes are configured in Helm values to use `/health/
 
 ### Phase 2 — semantic validation
 - [ ] Pinecone index seeded with 500+ known-good documents
-- [ ] Semantic cross-referencing via LangChain + OpenAI embeddings
+- [ ] Semantic cross-referencing via LangChain + OpenAI embeddings (generation remains via OpenRouter)
 - [ ] Legal clause pattern matching
 - [ ] Cross-document consistency checks (Patta ↔ Sale Deed number verification)
 
